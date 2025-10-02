@@ -1,0 +1,40 @@
+
+# SkyrimNet XTTS (Zonos emulated) Voice Configuration
+# 
+# For each setting, choose:
+#   "default" = Use recommended XTTS values (safest choice)
+#   "api"     = Use values from SkyrimNet UI (advanced users)
+#   number    = Set your own custom value (experts only)
+#
+# If unsure, leave everything as "default"
+
+# CFG_SCALE: How Closely to Follow the Recipe
+# Default: A great starting point.
+# Voice sounds strained or weird? Lower this value. It tells the model to be more relaxed 
+# and improvisational, great for expressive prompts.
+# Need maximum clarity and adherence to the text? Raise it slightly to keep the model on a tighter leash.
+cfg_scale = default
+
+# INFERENCE_TIMESTEPS: Simmering Time (Quality vs. Speed)
+# Need a quick snack? Use a lower number. Perfect for fast drafts and experiments.
+# Cooking a gourmet meal? Use a higher number. This lets the model "simmer" longer, 
+# refining the audio for superior detail and naturalness.
+# IMPORTANT: This uses the "confidence" slider in SkyrimNet UI when set to "api"
+inference_timesteps = default
+
+
+# Examples of custom values (advanced users):
+# cfg_scale = 2.0
+# inference_timesteps = 10
+
+
+#####################################################################
+# Caching Settings - Leave these alone unless you have problems
+
+# MEMORY CACHE: Faster repeated voice generation
+# true = faster (recommended), false = slower but uses less RAM
+enable_memory_cache = true
+
+# DISK CACHE: Save voices between sessions  
+# true = faster startup (recommended), false = slower but uses less disk space
+enable_disk_cache = true

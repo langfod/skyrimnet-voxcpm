@@ -1,0 +1,40 @@
+--extra-index-url=https://download.pytorch.org/whl/cu129
+torch<2.9
+torchaudio
+
+#TRITON*************************************
+#https://github.com/woct0rdho/triton-windows/releases/download/empty/triton-3.3.0-py3-none-any.whl ; sys_platform == 'win32' #egg:3.3.0
+triton-windows<3.5; sys_platform == 'win32' # tw
+
+psutil
+loguru
+pydantic
+uvicorn
+transformers
+gradio
+huggingface_hub
+hf_xet
+faster-whisper
+soundfile
+setuptools<81
+#cupy-cuda12x  #??
+numpy #
+#modelscope #
+
+#
+einops #
+#inflect #
+
+#wetext #
+
+#addict
+#datasets>=3,<4
+#simplejson
+#sortedcontainers
+#
+#funasr #?
+#spaces #?
+tqdm #
+#librosa #
+
+#noisereduce # testing this
