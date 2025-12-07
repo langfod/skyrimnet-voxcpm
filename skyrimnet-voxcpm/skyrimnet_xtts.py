@@ -15,7 +15,7 @@ from loguru import logger
 
 # Handle both direct execution and module execution
 try:
-    # Try relative imports first (for module execution: python -m skyrimnet-xtts)
+    # Try relative imports first (for module execution: python -m skyrimnet-voxcpm)
     from .shared_cache_utils import get_wavout_dir, get_latent_dir, get_speakers_dir
     from .shared_config import DEFAULT_CACHE_CONFIG
     from .shared_args import parse_gradio_args
@@ -23,7 +23,7 @@ try:
     from .shared_app_utils import initialize_application_environment
     from .shared_models import initialize_model_with_cache, setup_model_seed
 except ImportError:
-    # Fall back to absolute imports (for direct execution: python skyrimnet_xtts.py)
+    # Fall back to absolute imports 
     from shared_cache_utils import get_wavout_dir, get_latent_dir, get_speakers_dir
     from shared_config import DEFAULT_CACHE_CONFIG
     from shared_args import parse_gradio_args
@@ -38,7 +38,8 @@ except ImportError:
 # Global model state
 CURRENT_MODEL_TYPE = None
 CURRENT_MODEL = None
-IGNORE_PING = False
+IGNORE_PING = None
+SILENCE_AUDIO_PATH = "assets/silence_100ms.wav"
 # Cache flags - defaults that can be overridden by skyrimnet_config.txt
 ENABLE_DISK_CACHE = DEFAULT_CACHE_CONFIG["ENABLE_DISK_CACHE"]
 ENABLE_MEMORY_CACHE = DEFAULT_CACHE_CONFIG["ENABLE_MEMORY_CACHE"]
@@ -141,12 +142,23 @@ def generate_audio(model_choice:str=None, text:str=None, language:str="en", spea
     #    return "assets/silence_100ms.wav", seed
     #IGNORE_PING = True
 
-    speaker_audio_uuid = seed      
-    
+    job_id = seed      
+    global IGNORE_PING
+
+    if isinstance(speaker_audio, dict) and 'path' in speaker_audio:
+        speaker_audio = speaker_audio['path']
+    logger.info(f"inputs: text={text}, language={language}, speaker_audio={Path(speaker_audio).stem if speaker_audio else 'None'}, seed={seed}")
+
+    if text == "ping":
+       if IGNORE_PING is None:
+          IGNORE_PING = "pending"
+       else:
+          logger.info("Ping request received, sending silence audio.")
+          return SILENCE_AUDIO_PATH, job_id
+
     setup_model_seed(randomize=randomize_seed)
 
-    if speaker_audio is None or speaker_audio.strip() == "":
-        speaker_audio = "malebrute"
+    language, _ = language.split("-") if language is not None and "-" in language else ("en", None)
 
     # Get parameter overrides - only pass non-None values
     inference_kwargs = {}   
@@ -188,10 +200,15 @@ def generate_audio(model_choice:str=None, text:str=None, language:str="en", spea
         language=language,
         speaker_wav=speaker_audio,
         text=text,
-        uuid=speaker_audio_uuid,
         **inference_kwargs
     )
-    return wav_out_path, speaker_audio_uuid
+
+    if IGNORE_PING == "pending":
+        IGNORE_PING = True
+        Path(wav_out_path).unlink(missing_ok=True)
+        wav_out_path = SILENCE_AUDIO_PATH
+    
+    return wav_out_path, job_id
 
 
 def generate_gradio_audio(model_choice, text, speaker_audio, prefix_audio, 
@@ -293,10 +310,10 @@ def build_interface():
 
 if __name__ == "__main__":
     # Initialize application environment
-    initialize_application_environment("XTTS Text-to-Speech Application with Gradio Interface")
+    initialize_application_environment("SkyrimNet VoxCPM Text-to-Speech Application with Gradio Interface")
     
     # Load model with standardized initialization
-    CURRENT_MODEL = initialize_model_with_cache(use_cpu=args.use_cpu)
+    CURRENT_MODEL = initialize_model_with_cache(device=args.device)
 
     demo = build_interface()
     demo.launch(server_name=args.server, server_port=args.port, share=args.share, inbrowser=args.inbrowser, debug=True, show_api=True)

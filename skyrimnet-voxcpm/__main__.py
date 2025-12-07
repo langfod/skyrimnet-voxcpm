@@ -8,10 +8,76 @@ import sys
 import os
 from pathlib import Path
 
-# Add current directory to Python path for relative imports
-current_dir = Path(__file__).parent
-if str(current_dir) not in sys.path:
-    sys.path.insert(0, str(current_dir))
+# Handle PyInstaller frozen environment
+if getattr(sys, 'frozen', False):
+    # Running as compiled PyInstaller executable
+    # sys._MEIPASS is the temp directory where PyInstaller extracts files
+    bundle_dir = Path(sys._MEIPASS)
+    if str(bundle_dir) not in sys.path:
+        sys.path.insert(0, str(bundle_dir))
+else:
+    # Running from source - add current directory to Python path for relative imports
+    current_dir = Path(__file__).parent
+    if str(current_dir) not in sys.path:
+        sys.path.insert(0, str(current_dir))
+
+
+def _patch_cudagraph_tls():
+    """
+    Patch torch._inductor.cudagraph_trees to auto-initialize TLS in PyInstaller.
+    Must be called AFTER torch is imported but BEFORE torch.compile is used.
+    """
+    if not getattr(sys, 'frozen', False):
+        return  # Only needed for PyInstaller
+    
+    try:
+        import torch
+        import torch._inductor.cudagraph_trees as cgt
+        from collections import defaultdict
+        import threading
+        
+        # Check if already patched
+        if getattr(cgt, '_pyinstaller_patched', False):
+            return
+        
+        _original_get_obj = cgt.get_obj
+        
+        def _patched_get_obj(local, attr_name):
+            """Patched get_obj that auto-initializes TLS if needed"""
+            # First try the local attribute
+            if hasattr(local, attr_name):
+                return getattr(local, attr_name)
+            
+            # Check if TLS key exists
+            if torch._C._is_key_in_tls(attr_name):
+                return torch._C._get_obj_in_tls(attr_name)
+            
+            # TLS key doesn't exist - initialize it!
+            print(f"[PyInstaller] Auto-initializing TLS for: {attr_name}")
+            if attr_name == "tree_manager_containers":
+                value = {}
+                local.tree_manager_containers = value
+                torch._C._stash_obj_in_tls(attr_name, value)
+                return value
+            elif attr_name == "tree_manager_locks":
+                value = defaultdict(threading.Lock)
+                local.tree_manager_locks = value
+                torch._C._stash_obj_in_tls(attr_name, value)
+                return value
+            else:
+                # Unknown key - call original
+                return _original_get_obj(local, attr_name)
+        
+        cgt.get_obj = _patched_get_obj
+        cgt._pyinstaller_patched = True
+        print("[PyInstaller] Patched cudagraph_trees.get_obj for TLS auto-initialization")
+        
+    except Exception as e:
+        print(f"[PyInstaller] Warning: Failed to patch cudagraph_trees: {e}")
+
+
+# Apply the patch early, before any model loading
+_patch_cudagraph_tls()
 
 import uvicorn
 from loguru import logger
@@ -23,8 +89,7 @@ try:
     from .shared_args import parse_api_args
     from .shared_app_utils import setup_application_logging, initialize_application_environment
     from .shared_models import initialize_model_with_cache
-    from .shared_cache_utils import get_wavout_dir, get_latent_dir, get_speakers_dir
-
+    from .shared_cache_utils import get_wavout_dir, get_latent_dir, get_speakers_dir, get_cached_prompt_cache
     from . import skyrimnet_api
     from . import skyrimnet_xtts as skyrimnet_gradio
 except ImportError:
@@ -32,8 +97,7 @@ except ImportError:
     from shared_args import parse_api_args
     from shared_app_utils import setup_application_logging, initialize_application_environment
     from shared_models import initialize_model_with_cache
-    from shared_cache_utils import get_wavout_dir, get_latent_dir, get_speakers_dir
-
+    from shared_cache_utils import get_wavout_dir, get_latent_dir, get_speakers_dir, get_cached_prompt_cache
     import skyrimnet_api
     import skyrimnet_xtts as skyrimnet_gradio
 
@@ -57,10 +121,10 @@ def initialize_configuration():
 
 
 
-def initialize_model(use_cpu=False):
+def initialize_model(device="auto"):
     """Initialize and load the TTS model using shared utility"""
     return initialize_model_with_cache(
-        use_cpu=use_cpu,
+        device=device,
         seed=20250527,
         validate=True
     )
@@ -110,11 +174,24 @@ if __name__ == "__main__":
     
     # Initialize model using shared utility
     try:
-        model = initialize_model(use_cpu=args.use_cpu)
+        model = initialize_model(device=args.device)
     except Exception as e:
         logger.error(f"Model initialization failed: {e}")
         sys.exit(1)
     
+    # Warmup VoxCPM model with cached prompt cache
+    prompt_dict = get_cached_prompt_cache(model=model, language='en', speaker_audio='malecommoner')
+    inference_kwargs = {
+            'cfg_value': 2.0,
+            'inference_timesteps': 1,
+            'normalize': False,
+            'max_len': 16,
+            'prompt_cache': prompt_dict,
+            'text': "SkyrimNet VoxCPM warmup.",
+        }
+    wav_tensor0 = next(model._generate_with_prompt_cache_tensor(**inference_kwargs)) 
+    del wav_tensor0  # Free memory
+
     # Create unified application
     try:
         app = create_unified_app(model, args)

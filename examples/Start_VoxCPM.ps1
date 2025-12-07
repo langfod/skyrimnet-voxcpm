@@ -1,26 +1,17 @@
 <#
-.SYNOPSIS
-Starts SkyrimNet ChatterBox application with optional multilingual support.
-
-.DESCRIPTION
+PowerShell equivalent of 2_Start_Zonos.bat
 Designed to run on Windows 10 (PowerShell 5.1).
 
 Behavior:
 - Display banner
+- Attempt to run Visual Studio vcvars scripts (checks for presence and exit code)
 - Pause so user can inspect messages
 - Start the project using the venv python (if present) in a new window with HIGH priority
-- Optionally enable multilingual mode when --multilingual flag is provided
 
-.PARAMETER Multilingual
-Enable multilingual text-to-speech mode
-
-.EXAMPLE
-.\2_Start_VoxCPM.ps1
-Start VoxCPM in standard mode
-
-.EXAMPLE
-.\2_Start_VoxCPM.ps1 -cpu
-Start VoxCPM in standard mode using CPU only (no GPU)
+Parameters:
+- server: The server address to bind to (default: 0.0.0.0)
+- port: The port to listen on (default: 7860)
+- device: The device to run the model on (e.g., "cuda:0", "cuda:1") (optional)
 
 Notes:
 - If the venv python isn't found this script will try the system python in PATH.
@@ -28,9 +19,9 @@ Notes:
 #>
 
 param(
-    [string]$device = "auto",
     [string]$server = "0.0.0.0",
-    [int]$port = 7860
+    [int]$port = 7860,
+    [string]$device = "cuda:0"
 )
 
 function Show-Banner {
@@ -39,13 +30,13 @@ function Show-Banner {
  d8"     "8b  88                                 ""                      8888b     88                ,d     
  Y8,          88                                                         88 `8b    88                88     
  `Y8aaaaa,    88   ,d8  8b       d8  8b,dPPYba,  88  88,dPYba,,adPYba,   88  `8b   88   ,adPPYba,  MM88MMM  
-   `""""""8b,  88 ,a8"   `8b     d8'  88P'   "Y8  88  88P'   "88"    "8a  88   `8b  88  a8P_____88    88     
+   `""""""8b,  88 ,a8"   `8b     d8' 88P'   "Y8  88  88P'   "88"    "8a  88   `8b  88  a8P_____88    88     
          `8b  8888[      `8b   d8'   88          88  88      88      88  88    `8b 88  8PP"""""""    88     
  Y8a     a8P  88`"Yba,    `8b,d8'    88          88  88      88      88  88     `8888  "8b,   ,aa    88,    
   "Y88888P"   88   `Y8a     Y88'     88          88  88      88      88  88      `888   `"Ybbd8"'    "Y888  
                             d8'                                               
-                           d8'       VoxCPM (VoxCPM / Gradio / Zonos Emulated)                                       
- 
+                           d8'         VoxCPM - SkyrimNet TTS Module                                       
+
 '@
 
     Write-Host $banner
@@ -68,67 +59,59 @@ function Any_Key_Wait {
         [string]$msg = "Press any key to continue...",
         [int]$wait_sec = 5
     )
-    if ([Console]::KeyAvailable) {[Console]::ReadKey($true) }
+    if ([Console]::KeyAvailable) { [Console]::ReadKey($true) }
     $secondsRunning = $wait_sec;
     Write-Host "$msg" -NoNewline
     While ( !([Console]::KeyAvailable) -And ($secondsRunning -gt 0)) {
         Start-Sleep -Seconds 1;
         Write-Host “$secondsRunning..” -NoNewLine; $secondsRunning--
-}
-
-}
-Clear-Host
-Show-Banner
-
-
-Write-Host "`nAttempting to start SkyrimNet ChatterBox..." -ForegroundColor Green
-
-# Locate python to run the project. Prefer venv python if present.
-$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$venvPython = Join-Path $scriptRoot '.venv\Scripts\python.exe'
-
-if (Test-Path $venvPython) {
-    $pythonPath = $venvPython
-    Write-Host "Using virtualenv python: $pythonPath"
-} else {
-    $pyCmd = Get-Command python -ErrorAction SilentlyContinue
-    if ($pyCmd) {
-        $pythonPath = $pyCmd.Source
-        Write-Host "Using system python: $pythonPath"
-    } else {
-        Write-Host "No python executable found. Please create/activate a virtualenv or install Python and ensure it's in PATH." -ForegroundColor Red
-        Read-Host -Prompt "Press Enter to exit"
-        exit 1
     }
 }
 
-# Module to run (relative to repo root)
-$moduleToRun = Join-Path $scriptRoot 'skyrimnet-voxcpm'
-if (-not (Test-Path $moduleToRun)) {
-    Write-Host "Could not find module: $moduleToRun" -ForegroundColor Red
+Clear-Host
+Show-Banner
+
+# Set up Visual Studio 2022 x64 environment
+$currentDirectory = $PWD.Path
+$vsDevShellPath0 = "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\ToolsLaunch-VsDevShell.ps1"
+$vsDevShellPath1 = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1"
+if (Test-Path $vsDevShellPath0) {
+    & $vsDevShellPath0  -Arch amd64
+} elseif (Test-Path $vsDevShellPath1) {
+    & $vsDevShellPath1  -Arch amd64
+} else {
+    Write-Host "Visual Studio Dev Shell script not found. Install Visual Studio Build Tools 2022 with the C++ workload!" -ForegroundColor Yellow
+    exit 1
+}
+Set-Location -Path "${currentDirectory}"
+
+
+Write-Host "`nAttempting to start SkyrimNet VoxCPM..." -ForegroundColor Green
+
+$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$exePath = Join-Path $scriptRoot 'skyrimnet-voxcpm.exe'
+
+if (!$exePath) {
+    Write-Host "No executable found" -ForegroundColor Red
     Read-Host -Prompt "Press Enter to exit"
     exit 1
 }
 
-# Build Python script arguments - use parameters with defaults
-$pythonArgs = "--server $server --port $port"
-if ($device -and $device -ne "auto") {
-    $pythonArgs = "$pythonArgs --device $device"
-    Write-Host "Device set to $device" -ForegroundColor Cyan
-}
+
+$exeArgs = "--server $server --port $port --device $device"
 
 # Start a new PowerShell window, set the console title, and run the python module inside it.
-if ($pythonArgs) {
-    Write-Host "Starting new PowerShell window to run: $pythonPath -m skyrimnet-voxcpm $pythonArgs"
+if ($exeArgs) {
+    Write-Host "Starting new PowerShell window to run: $exePath $exeArgs"
 } else {
-    Write-Host "Starting new PowerShell window to run: $pythonPath -m skyrimnet-voxcpm"
+    Write-Host "Starting new PowerShell window to run: $exePath (with no arguments)"
 }
 
 # Build the command to run inside the new PowerShell instance. Escape $Host so it's evaluated by the child PowerShell.
-$psCommand = "`$Host.UI.RawUI.WindowTitle = 'SkyrimNet VoxCPM'; & '$pythonPath' -m skyrimnet-voxcpm $pythonArgs"
+$psCommand = "`$Host.UI.RawUI.WindowTitle = 'SkyrimNet VoxCPM'; & '$exePath' $exeArgs"
 
 # Launch PowerShell in a new window and keep it open (-NoExit) so errors remain visible.
-$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoExit','-Command',$psCommand) -WorkingDirectory $scriptRoot -PassThru
+$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoExit', '-Command', $psCommand) -WorkingDirectory $scriptRoot -PassThru
 try {
     # Set the PowerShell window process priority to High.
     $proc.PriorityClass = 'High'
@@ -137,6 +120,5 @@ try {
     Write-Host "Warning: failed to set process priority: $_" -ForegroundColor Yellow
 }
 
-Write-Host "`nSkyrimNet VoxCPM should start in another window. Default web server is http://localhost:7860" -ForegroundColor Green
-Write-Host "If that window closes immediately, run '.venv\Scripts\python -m skyrimnet-VoxCPM' to capture errors." -ForegroundColor Yellow
+Write-Host "`nSkyrimNet VoxCPM should start in another window. Default web server is http://localhost:$port" -ForegroundColor Green
 Any_Key_Wait -msg "Otherwise, you may close this window if it does not close itself.`n" -wait_sec 20

@@ -13,10 +13,8 @@ from loguru import logger
 
 # Local imports - Handle both direct and module execution
 try:
-    from .shared_cache_utils import get_cache_key
     from .shared_config import get_models_dir
 except ImportError:
-    from shared_cache_utils import get_cache_key
     from shared_config import get_models_dir
 
 
@@ -46,7 +44,9 @@ def initialize_whisper_model(device: str = None) -> WhisperModel:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        compute_type = "float16" if device == "cuda" else "int8"
+        device , device_index = device.split(":") if ":" in device else (device, 0)
+        device_index = int(device_index)
+        compute_type = "bfloat16" if device == "cuda" else "int8"
         
         # Use models directory for Whisper cache
         # Note: faster-whisper will download the CT2 format to this location
@@ -63,6 +63,7 @@ def initialize_whisper_model(device: str = None) -> WhisperModel:
             WHISPER_ENGINE = WhisperModel(
                 WHISPER_MODEL_NAME,
                 device=device,
+                device_index=device_index,
                 compute_type=compute_type,
                 download_root=whisper_cache
             )
@@ -117,7 +118,7 @@ def transcribe_audio_with_whisper(
         texts = []
         segments, info = WHISPER_ENGINE.transcribe(
             audio_path,
-            beam_size=2,
+            beam_size=10,
             vad_filter=True,
             without_timestamps=True,
             language=language if language != "zh-cn" else "zh"

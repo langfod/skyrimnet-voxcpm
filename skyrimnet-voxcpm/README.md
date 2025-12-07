@@ -27,14 +27,10 @@ python -m skyrimnet-xtts [OPTIONS]
 **Options:**
 - `--server HOST`: Server host address (default: localhost)
 - `--port PORT`: Server port number (default: 8020)
-- `--use_cpu`: Use CPU instead of CUDA for model inference
+- `--device`: CUDA device for model inference
 
 ### Examples
 
-**CPU Mode:**
-```bash
-python -m skyrimnet-xtts --use_cpu --port 8021
-```
 
 **Custom Host/Port:**
 ```bash

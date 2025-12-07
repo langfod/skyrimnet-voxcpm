@@ -2,7 +2,6 @@
 #!/usr/bin/env python3
 """
 SkyrimNet Simplified FastAPI TTS Service
-Simplified FastAPI service modeling APIs from xtts_api_server but using methodology from skyrimnet-xtts.py
 """
 
 # Standard library imports
@@ -13,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 from datetime import timedelta
-import numpy as np
+#import numpy as np
 # Third-party imports
 import uvicorn
 import time
@@ -25,7 +24,7 @@ from loguru import logger
 
 # Local imports - Handle both direct execution and module execution
 try:
-    # Try relative imports first (for module execution: python -m skyrimnet-xtts)
+    # Try relative imports first (for module execution: python -m skyrimnet-voxcpm)
     from .shared_cache_utils import get_cached_prompt_cache
     from .shared_args import parse_api_args
     from .shared_audio_utils import generate_audio_file
@@ -48,6 +47,11 @@ except ImportError:
 CURRENT_MODEL = None
 IGNORE_PING = False
 CACHED_TEMP_DIR = None
+SILENCE_AUDIO_PATH = "assets/silence_100ms.wav"
+_CONFIG_CACHE = None
+_CONFIG_FILE_PATH = "skyrimnet_config.txt"
+CFG_VALUE = 2.1
+INFERENCE_TIMESTEPS = 5
 # =============================================================================
 # COMMAND LINE ARGUMENT PARSING
 # =============================================================================
@@ -103,6 +107,49 @@ def get_cached_temp_dir():
     
     return CACHED_TEMP_DIR
 
+def load_skyrimnet_config():
+    """Load configuration from skyrimnet_config.txt - simplified version"""
+    global _CONFIG_CACHE, ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
+    
+    if _CONFIG_CACHE is not None:
+        return _CONFIG_CACHE
+    
+    # Simple config loading - just get user overrides from file
+    config_overrides = {}
+    if Path(_CONFIG_FILE_PATH).exists():
+        try:
+            with open(_CONFIG_FILE_PATH, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            key = key.strip().lower()
+                            value = value.strip()
+                            
+                            # Parse TTS parameters
+                            if key == 'cfg_value':
+                                if value.lower() != "default":
+                                    try:
+                                        config_overrides[key] = float(value)
+                                    except ValueError:
+                                        logger.warning(f"Invalid value for {key}: {value}")
+                            elif key == 'inference_timesteps':
+                                if value.lower() != "default":
+                                    try:
+                                        config_overrides[key] = int(float(value))  # Convert to int, allowing decimal input
+                                    except ValueError:
+                                        logger.warning(f"Invalid value for {key}: {value}")
+        except Exception as e:
+            logger.warning(f"Error loading config file {_CONFIG_FILE_PATH}: {e}")
+    
+    _CONFIG_CACHE = config_overrides
+    return _CONFIG_CACHE
+
+def get_config_override(param_name):
+    """Get config override value, only using API value in API mode"""
+    config_overrides = load_skyrimnet_config()
+    config_value = config_overrides.get(param_name)
 # =============================================================================
 # FASTAPI APPLICATION SETUP
 # =============================================================================
@@ -191,32 +238,42 @@ async def tts_to_audio(request: SynthesisRequest, background_tasks: BackgroundTa
         if not request.text:
             raise HTTPException(status_code=400, detail="Text is required")
         
-
-        if request.text == "ping" and (request.speaker_wav == 'maleeventoned' or request.speaker_wav == 'player voice') and not IGNORE_PING:
-            IGNORE_PING = True
-            return FileResponse(
-                path="assets/silence_100ms.wav",
-                filename=request.save_path,
-                media_type="audio/wav"
-            )
-        IGNORE_PING = True
+        if request.text == "ping":
+            if IGNORE_PING is None:
+                IGNORE_PING = "pending"
+            else:
+                logger.info("Ping request received, sending silence audio.")            
+                return FileResponse(
+                    path=SILENCE_AUDIO_PATH,
+                    filename=request.save_path,
+                    media_type="audio/wav"
+                )
     
-        
+        language = request.language
+        language, _ = language.split("-") if language is not None and "-" in language else ("en", None)
+
         # Get latents from speaker
         speaker_wav = request.speaker_wav or "malecommoner"
         text = request.text
-
+        language = request.language or "en"
         wav_out_path = generate_audio_file(
             model=CURRENT_MODEL,
+            language=language,
             speaker_wav=speaker_wav,
-            text=text
+            text=text,
+            cfg_value=CFG_VALUE,
+            inference_timesteps=INFERENCE_TIMESTEPS,
         )
                     
+        if IGNORE_PING == "pending":
+            IGNORE_PING = True
+            Path(wav_out_path).unlink(missing_ok=True)
+            wav_out_path = SILENCE_AUDIO_PATH      
         return FileResponse(
             path=str(wav_out_path),
             filename=request.save_path,
             media_type="audio/wav"
-        )            
+        )             
     except HTTPException:
         raise
     except Exception as e:
@@ -245,6 +302,8 @@ async def create_and_store_latents(
         if not wav_file.filename.endswith('.wav'):
             raise HTTPException(status_code=400, detail="Only WAV files are supported")
         
+        language, _ = language.split("-") if language is not None and "-" in language else ("en", None)
+
         # Use cached temp directory and create unique filename
         temp_dir = get_cached_temp_dir()
         #unique_filename = f"{uuid.uuid4().hex}_{wav_file.filename}"
@@ -283,127 +342,127 @@ async def health_check():
         "model_loaded": CURRENT_MODEL is not None,
     }
 
-WHISPER_DEFAULT_SETTINGS = {
-#    "whisper_model": "turbo",
-    "temperature": 0.0,
-    "temperature_increment_on_fallback": 0.2,
-    "no_speech_threshold": 0.6,
-    "logprob_threshold": -1.0,
-    "compression_ratio_threshold": 2.4,
-    "condition_on_previous_text": True,
-    "verbose": False,
-    "task": "transcribe",
-}
-def transcribe(audio_path: str, **whisper_args):
-    """Transcribe the audio file using whisper"""
-    global whisper_model
-
-    # Set configs & transcribe
-    if whisper_args["temperature_increment_on_fallback"] is not None:
-        whisper_args["temperature"] = tuple(
-            np.arange(whisper_args["temperature"], 1.0 + 1e-6, whisper_args["temperature_increment_on_fallback"])
-        )
-    else:
-        whisper_args["temperature"] = [whisper_args["temperature"]]
-
-    del whisper_args["temperature_increment_on_fallback"]
-
-    transcript = whisper_model.transcribe(
-        audio_path,
-        **whisper_args,
-    )
-
-    return transcript
-@app.post('/v1/audio/transcriptions')
-async def transcriptions(model: str = Form(...),
-                         file: UploadFile = File(...),
-                         response_format: Optional[str] = Form(None),
-                         language: Optional[str] = Form(None),
-                         prompt: Optional[str] = Form(None),
-                         temperature: Optional[float] = Form(None)):
-
-    model = initialize_whisper_model()
-    if file is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Bad Request, bad file"
-            )
-    if response_format is None:
-        response_format = 'json'
-    if response_format not in ['json',
-                           'text',
-                           'srt',
-                           'verbose_json',
-                           'vtt']:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Bad Request, bad response_format"
-            )
-    if temperature is None:
-        temperature = 0.0
-    if temperature < 0.0 or temperature > 1.0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Bad Request, bad temperature"
-            )
-
-    filename = file.filename
-    fileobj = file.file
-    
-    whisper_tempdir = Path("whisper_temp")
-    whisper_tempdir.mkdir(parents=True, exist_ok=True)
-    upload_name = whisper_tempdir.joinpath(filename)
-    upload_file = open(upload_name, 'wb')
-    shutil.copyfileobj(fileobj, upload_file)
-    upload_file.close()
-
-    settings = WHISPER_DEFAULT_SETTINGS.copy()
-    settings['temperature'] = temperature
-    if language is not None:
-        settings['language'] = language # TODO: check  ISO-639-1  format
-
-    transcript = transcribe(audio_path=upload_name, **settings)
-
-    if upload_name:
-        os.remove(upload_name)
-
-    if response_format in ['text']:
-        return Response(content=transcript['text'], media_type="text/plain")
-
-    if response_format in ['srt']:
-        ret = ""
-        for seg in transcript['segments']:
-            
-            td_s = timedelta(milliseconds=seg["start"]*1000)
-            td_e = timedelta(milliseconds=seg["end"]*1000)
-
-            t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02},{td_s.microseconds//1000:03}'
-            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02},{td_e.microseconds//1000:03}'
-
-            ret += '{}\n{} --> {}\n{}\n\n'.format(seg["id"], t_s, t_e, seg["text"].strip())
-        ret += '\n'
-        return Response(content=ret, media_type="text/plain")
-
-    if response_format in ['vtt']:
-        ret = "WEBVTT\n\n"
-        for seg in transcript['segments']:
-            td_s = timedelta(milliseconds=seg["start"]*1000)
-            td_e = timedelta(milliseconds=seg["end"]*1000)
-
-            t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
-            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
-
-            ret += "{} --> {}\n{}\n\n".format(t_s, t_e, seg["text"].strip())
-        return Response(content=ret, media_type="text/plain")
-
-    if response_format in ['verbose_json']:
-        transcript.setdefault('task', WHISPER_DEFAULT_SETTINGS['task'])
-        transcript.setdefault('duration', transcript['segments'][-1]['end'])
-        if transcript['language'] == 'ja':
-            transcript['language'] = 'japanese'
-        return transcript
-
-    return {'text': transcript['text']}
+#WHISPER_DEFAULT_SETTINGS = {
+##    "whisper_model": "turbo",
+#    "temperature": 0.0,
+#    "temperature_increment_on_fallback": 0.2,
+#    "no_speech_threshold": 0.6,
+#    "logprob_threshold": -1.0,
+#    "compression_ratio_threshold": 2.4,
+#    "condition_on_previous_text": True,
+#    "verbose": False,
+#    "task": "transcribe",
+#}
+#def transcribe(audio_path: str, **whisper_args):
+#    """Transcribe the audio file using whisper"""
+#    global whisper_model
+#
+#    # Set configs & transcribe
+#    if whisper_args["temperature_increment_on_fallback"] is not None:
+#        whisper_args["temperature"] = tuple(
+#            np.arange(whisper_args["temperature"], 1.0 + 1e-6, whisper_args["temperature_increment_on_fallback"])
+#        )
+#    else:
+#        whisper_args["temperature"] = [whisper_args["temperature"]]
+#
+#    del whisper_args["temperature_increment_on_fallback"]
+#
+#    transcript = whisper_model.transcribe(
+#        audio_path,
+#        **whisper_args,
+#    )
+#
+#    return transcript
+#@app.post('/v1/audio/transcriptions')
+#async def transcriptions(model: str = Form(...),
+#                         file: UploadFile = File(...),
+#                         response_format: Optional[str] = Form(None),
+#                         language: Optional[str] = Form(None),
+#                         prompt: Optional[str] = Form(None),
+#                         temperature: Optional[float] = Form(None)):
+#
+#    model = initialize_whisper_model()
+#    if file is None:
+#        raise HTTPException(
+#            status_code=status.HTTP_400_BAD_REQUEST,
+#            detail=f"Bad Request, bad file"
+#            )
+#    if response_format is None:
+#        response_format = 'json'
+#    if response_format not in ['json',
+#                           'text',
+#                           'srt',
+#                           'verbose_json',
+#                           'vtt']:
+#        raise HTTPException(
+#            status_code=status.HTTP_400_BAD_REQUEST,
+#            detail=f"Bad Request, bad response_format"
+#            )
+#    if temperature is None:
+#        temperature = 0.0
+#    if temperature < 0.0 or temperature > 1.0:
+#        raise HTTPException(
+#            status_code=status.HTTP_400_BAD_REQUEST,
+#            detail=f"Bad Request, bad temperature"
+#            )
+#
+#    filename = file.filename
+#    fileobj = file.file
+#    
+#    whisper_tempdir = Path("whisper_temp")
+#    whisper_tempdir.mkdir(parents=True, exist_ok=True)
+#    upload_name = whisper_tempdir.joinpath(filename)
+#    upload_file = open(upload_name, 'wb')
+#    shutil.copyfileobj(fileobj, upload_file)
+#    upload_file.close()
+#
+#    settings = WHISPER_DEFAULT_SETTINGS.copy()
+#    settings['temperature'] = temperature
+#    if language is not None:
+#        settings['language'] = language # TODO: check  ISO-639-1  format
+#
+#    transcript = transcribe(audio_path=upload_name, **settings)
+#
+#    if upload_name:
+#        os.remove(upload_name)
+#
+#    if response_format in ['text']:
+#        return Response(content=transcript['text'], media_type="text/plain")
+#
+#    if response_format in ['srt']:
+#        ret = ""
+#        for seg in transcript['segments']:
+#            
+#            td_s = timedelta(milliseconds=seg["start"]*1000)
+#            td_e = timedelta(milliseconds=seg["end"]*1000)
+#
+#            t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02},{td_s.microseconds//1000:03}'
+#            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02},{td_e.microseconds//1000:03}'
+#
+#            ret += '{}\n{} --> {}\n{}\n\n'.format(seg["id"], t_s, t_e, seg["text"].strip())
+#        ret += '\n'
+#        return Response(content=ret, media_type="text/plain")
+#
+#    if response_format in ['vtt']:
+#        ret = "WEBVTT\n\n"
+#        for seg in transcript['segments']:
+#            td_s = timedelta(milliseconds=seg["start"]*1000)
+#            td_e = timedelta(milliseconds=seg["end"]*1000)
+#
+#            t_s = f'{td_s.seconds//3600:02}:{(td_s.seconds//60)%60:02}:{td_s.seconds%60:02}.{td_s.microseconds//1000:03}'
+#            t_e = f'{td_e.seconds//3600:02}:{(td_e.seconds//60)%60:02}:{td_e.seconds%60:02}.{td_e.microseconds//1000:03}'
+#
+#            ret += "{} --> {}\n{}\n\n".format(t_s, t_e, seg["text"].strip())
+#        return Response(content=ret, media_type="text/plain")
+#
+#    if response_format in ['verbose_json']:
+#        transcript.setdefault('task', WHISPER_DEFAULT_SETTINGS['task'])
+#        transcript.setdefault('duration', transcript['segments'][-1]['end'])
+#        if transcript['language'] == 'ja':
+#            transcript['language'] = 'japanese'
+#        return transcript
+#
+#    return {'text': transcript['text']}
 # =============================================================================
 # CATCH-ALL ROUTE CONFIGURATION
 # =============================================================================
@@ -486,20 +545,43 @@ if __name__ == "__main__":
     # Initialize application environment
     initialize_application_environment("SkyrimNet TTS API")
     
+    cfg_value = get_config_override('cfg_value')
+    if cfg_value is not None and isinstance(cfg_value, float):
+        CFG_VALUE = cfg_value
+        logger.info(f"Using overridden cfg_value from config: {CFG_VALUE}")
+    inference_timesteps = get_config_override('inference_timesteps')
+    if inference_timesteps is not None and isinstance(inference_timesteps, int):
+        INFERENCE_TIMESTEPS = inference_timesteps
+        logger.info(f"Using overridden inference_timesteps from config: {INFERENCE_TIMESTEPS}")
+
     # Set up full catch-all route for standalone API mode
     setup_catch_all_route()
     
     # Load model with standardized initialization
     try:
         CURRENT_MODEL = initialize_model_with_cache(
-            use_cpu=args.use_cpu,
+            device=args.device,
             validate=True
         )
         logger.info("Model loaded successfully")
+
+        # Warmup VoxCPM model with cached prompt cache
+        prompt_dict = get_cached_prompt_cache(model=CURRENT_MODEL, language='en', speaker_audio='malecommoner')
+        inference_kwargs = {
+            'cfg_value': CFG_VALUE,
+            'inference_timesteps': INFERENCE_TIMESTEPS,
+            'max_len': 16,
+            'prompt_cache': prompt_dict,
+            'text': "SkyrimNet VoxCPM warmup.",
+        }
+        wav_tensor0 = next(CURRENT_MODEL._generate_with_prompt_cache_tensor(**inference_kwargs)) 
+        del wav_tensor0  # Free memory
+
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         sys.exit(1)
     
+
     # Start server
     logger.info(f"Starting server on {args.server}:{args.port}")
     uvicorn.run(

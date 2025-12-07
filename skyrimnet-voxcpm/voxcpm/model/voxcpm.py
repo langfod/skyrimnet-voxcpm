@@ -19,24 +19,38 @@ limitations under the License.
 """
 
 import os
-from typing import Tuple, Union, Generator, List
-import warnings
+from typing import Dict, Tuple, Union, Generator, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchaudio
+import warnings
 from einops import rearrange
 from pydantic import BaseModel
+
+try:
+    from safetensors.torch import load_file
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
 from tqdm import tqdm
 from transformers import LlamaTokenizerFast
 
-from ..modules.audiovae import AudioVAE
+from ..modules.audiovae import AudioVAE, AudioVAEConfig
 from ..modules.layers import ScalarQuantizationLayer
+from ..modules.layers.lora import apply_lora_to_named_linear_modules
 from ..modules.locdit import CfmConfig, UnifiedCFM, VoxCPMLocDiT
 from ..modules.locenc import VoxCPMLocEnc
 from ..modules.minicpm4 import MiniCPM4Config, MiniCPMModel
 from .utils import get_dtype, mask_multichar_chinese_tokens
 
+# Import shared_audio_utils - handle both package and PyInstaller contexts
+try:
+    from shared_audio_utils import load_wav_as_tensor
+except ImportError:
+    from ...shared_audio_utils import load_wav_as_tensor
+    
 
 class VoxCPMEncoderConfig(BaseModel):
     hidden_dim: int = 1024
@@ -66,10 +80,31 @@ class VoxCPMConfig(BaseModel):
 
     encoder_config: VoxCPMEncoderConfig
     dit_config: VoxCPMDitConfig
+    audio_vae_config: Optional[AudioVAEConfig] = None
 
     max_length: int = 4096
     device: str = "cuda"
     dtype: str = "bfloat16"
+    dit_mean_mode: bool = False
+
+
+class LoRAConfig(BaseModel):
+    enable_lm: bool = False        # Apply LoRA to base_lm + residual_lm
+    enable_dit: bool = False       # Apply LoRA to VoxCPMLocDiT
+    enable_proj: bool = False      # Apply LoRA to projection Linear layers
+
+    r: int = 8
+    alpha: int = 16
+    dropout: float = 0.0
+
+    # Target linear layer names for LM & DiT (matched by attribute name)
+    target_modules_lm: list[str] = ["q_proj", "v_proj", "k_proj", "o_proj"]
+    target_modules_dit: list[str] = ["q_proj", "v_proj", "k_proj", "o_proj"]
+    # Projection layer attribute names to find on VoxCPMModel
+    target_proj_modules: list[str] = ["enc_to_lm_proj", "lm_to_dit_proj", "res_to_dit_proj"]
+
+
+VoxCPMConfig.model_rebuild()
 
 
 class VoxCPMModel(nn.Module):
@@ -78,9 +113,11 @@ class VoxCPMModel(nn.Module):
         config: VoxCPMConfig,
         tokenizer: LlamaTokenizerFast,
         audio_vae: AudioVAE,
+        lora_config: LoRAConfig = None,
     ):
         super().__init__()
         self.config = config
+        self.lora_config = lora_config
         self.feat_dim = config.feat_dim
         self.patch_size = config.patch_size
         self.device = config.device
@@ -128,6 +165,7 @@ class VoxCPMModel(nn.Module):
             in_channels=config.feat_dim,
             cfm_params=config.dit_config.cfm_config,
             estimator=VoxCPMLocDiT(decoder_config, in_channels=config.feat_dim),
+            mean_mode=config.dit_mean_mode,
         )
 
         # Projection layers
@@ -145,43 +183,46 @@ class VoxCPMModel(nn.Module):
         self.stop_proj = nn.Linear(config.lm_config.hidden_size, config.lm_config.hidden_size)
         self.stop_actn = nn.SiLU()
         self.stop_head = nn.Linear(config.lm_config.hidden_size, 2, bias=False)
+        self.stop_loss = nn.CrossEntropyLoss(reduction="none")
 
         # Audio VAE
         self.audio_vae = audio_vae
         self.chunk_size = audio_vae.chunk_size
         self.sample_rate = audio_vae.sample_rate
 
-    
-    def optimize(self, disable: bool = False, force_mode: str = None):
-        """
-        Optimize VoxCPM model with torch.compile using progressive fallback strategy.
-        
-        Tries compilation modes in order of decreasing aggressiveness:
-        1. reduce-overhead (most aggressive, may fail on Windows with large tensors)
-        2. default (moderate optimization, better compatibility)
-        3. disable optimization (fallback)
-        
-        Args:
-            disable: If True, skip optimization entirely
-            force_mode: If specified, force a specific compilation mode
-        """
+        if self.lora_config is not None:
+            self._apply_lora()
+
+    def _apply_lora(self):
+        """注入 LoRA 到 LM / DiT / 投影层"""
+        cfg = self.lora_config
+        lora_kwargs = dict(r=cfg.r, alpha=cfg.alpha, dropout=cfg.dropout)
+
+        # LM: base_lm + residual_lm
+        if cfg.enable_lm:
+            for lm in [self.base_lm, self.residual_lm]:
+                apply_lora_to_named_linear_modules(
+                    lm, target_submodule_names=cfg.target_modules_lm, **lora_kwargs
+                )
+
+        # DiT: feat_decoder.estimator
+        if cfg.enable_dit:
+            apply_lora_to_named_linear_modules(
+                self.feat_decoder.estimator, target_submodule_names=cfg.target_modules_dit, **lora_kwargs
+            )
+
+        # 投影层
+        if cfg.enable_proj:
+            from ..modules.layers.lora import LoRALinear
+            for attr_name in cfg.target_proj_modules:
+                module = getattr(self, attr_name, None)
+                if isinstance(module, nn.Linear):
+                    setattr(self, attr_name, LoRALinear(base=module, **lora_kwargs))
+
+    def optimize(self, disable: bool = False):
+        if disable:
+            return self
         try:
-            if disable:
-                print("Disabling torch.compile optimization")
-                # Store references to original functions if not already stored
-                if not hasattr(self, '_original_base_lm_forward_step'):
-                    self._original_base_lm_forward_step = self.base_lm.forward_step.__func__ if hasattr(self.base_lm.forward_step, '__func__') else self.base_lm.forward_step
-                    self._original_residual_lm_forward_step = self.residual_lm.forward_step.__func__ if hasattr(self.residual_lm.forward_step, '__func__') else self.residual_lm.forward_step
-                    self._original_feat_encoder = self.feat_encoder
-                    self._original_feat_decoder_estimator = self.feat_decoder.estimator
-                
-                # Reset to original functions
-                self.base_lm.forward_step = self._original_base_lm_forward_step
-                self.residual_lm.forward_step = self._original_residual_lm_forward_step
-                self.feat_encoder_step = self._original_feat_encoder
-                self.feat_decoder.estimator = self._original_feat_decoder_estimator
-                return self
-                
             if self.device != "cuda":
                 raise ValueError("VoxCPMModel can only be optimized on CUDA device")
             try:
@@ -189,101 +230,121 @@ class VoxCPMModel(nn.Module):
             except:
                 raise ValueError("triton is not installed")
             
-            # Store original functions before compilation attempt
-            if not hasattr(self, '_original_base_lm_forward_step'):
-                self._original_base_lm_forward_step = self.base_lm.forward_step
-                self._original_residual_lm_forward_step = self.residual_lm.forward_step
-                self._original_feat_encoder = self.feat_encoder
-                self._original_feat_decoder_estimator = self.feat_decoder.estimator
-            
-            # Handle forced mode directly without loop
-            if force_mode:
-                mode = force_mode
-                fullgraph = False
-                print(f"Attempting torch.compile with forced mode='{mode}'")
-                
-                # Compile all components with forced mode
-                self.base_lm.forward_step = torch.compile(
-                    self._original_base_lm_forward_step, 
-                    mode=mode, 
-                    fullgraph=fullgraph
-                )
-                self.residual_lm.forward_step = torch.compile(
-                    self._original_residual_lm_forward_step, 
-                    mode=mode, 
-                    fullgraph=fullgraph
-                )
-                self.feat_encoder_step = torch.compile(
-                    self._original_feat_encoder, 
-                    mode=mode, 
-                    fullgraph=fullgraph
-                )
-                self.feat_decoder.estimator = torch.compile(
-                    self._original_feat_decoder_estimator, 
-                    mode=mode, 
-                    fullgraph=fullgraph
-                )
-                
-                print(f"✓ Successfully optimized VoxCPMModel with forced mode='{mode}'")
-                return self
-            
-            # Try fallback modes only when no force_mode is specified
-            compilation_modes = [
-                ("reduce-overhead", True, "Maximum optimization (may fail on Windows)"),
-                ("default", False, "Standard optimization (better compatibility)"),
-            ]
-            
-            for mode, fullgraph, description in compilation_modes:
-                try:
-                    print(f"Attempting torch.compile with mode='{mode}' - {description}")
-                    
-                    # Try compiling all components with current mode
-                    self.base_lm.forward_step = torch.compile(
-                        self._original_base_lm_forward_step, 
-                        mode=mode, 
-                        fullgraph=fullgraph
-                    )
-                    self.residual_lm.forward_step = torch.compile(
-                        self._original_residual_lm_forward_step, 
-                        mode=mode, 
-                        fullgraph=fullgraph
-                    )
-                    self.feat_encoder_step = torch.compile(
-                        self._original_feat_encoder, 
-                        mode=mode, 
-                        fullgraph=fullgraph
-                    )
-                    self.feat_decoder.estimator = torch.compile(
-                        self._original_feat_decoder_estimator, 
-                        mode=mode, 
-                        fullgraph=fullgraph
-                    )
-                    
-                    print(f"✓ Successfully optimized VoxCPMModel with mode='{mode}'")
-                    return self
-                    
-                except Exception as compile_e:
-                    print(f"✗ torch.compile mode='{mode}' failed: {compile_e}")
-                    # Reset to original functions before trying next mode
-                    self.base_lm.forward_step = self._original_base_lm_forward_step
-                    self.residual_lm.forward_step = self._original_residual_lm_forward_step
-                    self.feat_encoder_step = self._original_feat_encoder
-                    self.feat_decoder.estimator = self._original_feat_decoder_estimator
-                    continue
-            
-            # If all compilation modes fail, use original functions
-            raise ValueError("All torch.compile modes failed")
-            
+            # On Windows, Triton has issues with "reduce-overhead" mode due to 
+            # 32-bit long overflow in CUDA graph operations. Use "default" mode instead.
+            #import sys
+            #if sys.platform == "win32":
+            #    compile_mode = "default"
+            #    print(f"Windows detected: using torch.compile mode='{compile_mode}' (reduce-overhead causes Triton overflow errors)")
+            #else:
+            #    compile_mode = "reduce-overhead"
+            compile_mode = "reduce-overhead"
+            self.base_lm.forward_step = torch.compile(self.base_lm.forward_step, mode=compile_mode, fullgraph=True)
+            self.residual_lm.forward_step = torch.compile(self.residual_lm.forward_step, mode=compile_mode, fullgraph=True)
+            self.feat_encoder = torch.compile(self.feat_encoder, mode=compile_mode, fullgraph=True)
+            self.feat_decoder.estimator = torch.compile(self.feat_decoder.estimator, mode=compile_mode, fullgraph=True)
         except Exception as e:
-            print(f"Error: {e}")
-            print("Warning: VoxCPMModel can not be optimized by torch.compile, using original forward_step functions")
-            # Ensure we fall back to original functions
-            if hasattr(self, '_original_base_lm_forward_step'):
-                self.base_lm.forward_step = self._original_base_lm_forward_step
-                self.residual_lm.forward_step = self._original_residual_lm_forward_step
-                self.feat_encoder_step = self._original_feat_encoder
-                self.feat_decoder.estimator = self._original_feat_decoder_estimator
+            print(f"Warning: torch.compile disabled - {e}")
         return self
+
+    def forward(
+        self,
+        text_tokens: torch.Tensor,
+        text_mask: torch.Tensor,
+        audio_feats: torch.Tensor,
+        audio_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        progress: float = 0.0,
+        sample_generate: bool = False,
+    ):
+        del position_ids  # not used yet
+
+        text_tokens = text_tokens.to(self.device, dtype=torch.long)
+        text_mask = text_mask.to(self.device, dtype=self._dtype())
+        audio_feats = audio_feats.to(self.device, dtype=self._dtype())
+        audio_mask = audio_mask.to(self.device, dtype=self._dtype())
+        loss_mask = loss_mask.to(self.device, dtype=self._dtype())
+        labels = labels.to(self.device, dtype=torch.long)
+
+        B, T, P, D = audio_feats.shape
+        feat_embed = self.feat_encoder(audio_feats)
+        feat_embed = self.enc_to_lm_proj(feat_embed)
+
+        scale_emb = getattr(self.config.lm_config, "scale_emb", 1.0)
+        if not getattr(self.config.lm_config, "use_mup", False):
+            scale_emb = 1.0
+        text_embed = self.base_lm.embed_tokens(text_tokens) * scale_emb
+        combined_embed = text_mask.unsqueeze(-1) * text_embed + audio_mask.unsqueeze(-1) * feat_embed
+
+        enc_outputs, _ = self.base_lm(inputs_embeds=combined_embed, is_causal=True)
+        enc_outputs = enc_outputs.to(self._dtype())
+        enc_outputs = self.fsq_layer(enc_outputs) * audio_mask.unsqueeze(-1) + enc_outputs * text_mask.unsqueeze(-1)
+        lm_hidden = torch.cat((torch.zeros_like(enc_outputs[:, 0:1, :]), enc_outputs[:, :-1, :]), dim=1)
+
+        residual_inputs = enc_outputs + audio_mask.unsqueeze(-1) * feat_embed
+        residual_outputs, _ = self.residual_lm(inputs_embeds=residual_inputs, is_causal=True)
+        residual_outputs = residual_outputs.to(self._dtype())
+        residual_hidden = torch.cat(
+            (torch.zeros_like(residual_outputs[:, 0:1, :]), residual_outputs[:, :-1, :]),
+            dim=1,
+        )
+
+        dit_hidden = self.lm_to_dit_proj(lm_hidden) + self.res_to_dit_proj(residual_hidden)
+        dit_hidden = rearrange(dit_hidden, "b t c -> (b t) c")
+
+        # Keep diffusion inputs in the same dtype as the model (e.g., bfloat16)
+        target_dtype = self._dtype()
+
+        feat_gt = rearrange(audio_feats.to(target_dtype), "b t p d -> (b t) p d")
+        feat_cond = torch.cat(
+            (torch.zeros_like(audio_feats[:, 0:1, ...]), audio_feats[:, :-1, ...]),
+            dim=1,
+        )
+        feat_cond = rearrange(feat_cond.to(target_dtype), "b t p d -> (b t) p d")
+
+        loss_seq_mask = loss_mask.unsqueeze(-1).repeat(1, 1, self.patch_size)
+        loss_seq_mask = rearrange(loss_seq_mask, "b t p -> (b t) p 1").to(target_dtype)
+
+        diff_loss = self.feat_decoder.compute_loss(
+            feat_gt.transpose(1, 2).contiguous(),
+            dit_hidden,
+            cond=feat_cond.transpose(1, 2).contiguous(),
+            tgt_mask=loss_seq_mask.transpose(1, 2).contiguous(),
+            progress=progress,
+        )
+
+        stop_logits = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden)))
+        stop_losses = self.stop_loss(stop_logits.transpose(1, 2), labels)
+        denom = torch.clamp(loss_mask.sum(), min=1.0)
+        stop_loss = (stop_losses * loss_mask).sum() / denom
+
+        feat_pred = None
+        if sample_generate:
+            feat_cond_for_sample = feat_cond.transpose(1, 2).contiguous()
+            feat_pred_seq = self.feat_decoder(
+                mu=dit_hidden,
+                patch_size=self.patch_size,
+                cond=feat_cond_for_sample,
+                n_timesteps=self.config.dit_config.cfm_config.inference_cfg_rate
+                if hasattr(self.config.dit_config.cfm_config, "inference_cfg_rate")
+                else 10,
+            )
+            feat_pred = rearrange(feat_pred_seq.transpose(1, 2), "(b t) d p -> b d (t p)", b=B, p=self.patch_size)
+
+        feat_gt_tensor = rearrange(feat_gt, "(b t) p d -> b d (t p)", b=B, p=self.patch_size)
+
+        return {
+            "loss/diff": diff_loss,
+            "loss/stop": stop_loss,
+            "feat_gt": feat_gt_tensor,
+            "feat_pred": feat_pred,
+        }
+
+    def _dtype(self):
+        return get_dtype(self.config.dtype)
 
 
     def generate(self, *args, **kwargs) -> torch.Tensor:
@@ -326,13 +387,14 @@ class VoxCPMModel(nn.Module):
             )
             text_length = text_token.shape[0]
 
+            # Create audio_feat on model device (GPU) for consistent device placement
             audio_feat = torch.zeros(
                 (text_length, self.patch_size, self.audio_vae.latent_dim),
                 dtype=torch.float32,
-                device=text_token.device,
+                device=self.device,
             )
-            text_mask = torch.ones(text_length).type(torch.int32).to(text_token.device)
-            audio_mask = torch.zeros(text_length).type(torch.int32).to(text_token.device)
+            text_mask = torch.ones(text_length, dtype=torch.int32, device=self.device)
+            audio_mask = torch.zeros(text_length, dtype=torch.int32, device=self.device)
 
         else:
             text = prompt_text + target_text
@@ -346,42 +408,46 @@ class VoxCPMModel(nn.Module):
             )
             text_length = text_token.shape[0]
 
-            audio, sr = torchaudio.load(prompt_wav_path)
+            audio, sr = load_wav_as_tensor(prompt_wav_path)
             if audio.size(0) > 1:
-                audio = audio.mean(dim=0, keepdim=True)
-                
+                audio = audio.mean(dim=0, keepdim=True)    
+
             if sr != self.sample_rate:
                 audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
 
             patch_len = self.patch_size * self.chunk_size
 
             if audio.size(1) % patch_len != 0:
-                audio = torch.nn.functional.pad(audio, (0, patch_len - audio.size(1) % patch_len))
+                # 左填充：在音频开头填充，保持有效音频数据在序列末尾
+                padding_size = patch_len - audio.size(1) % patch_len
+                audio = torch.nn.functional.pad(audio, (padding_size, 0))
 
-            # (B, D, T) - keep on device for consistency
+            # (B, D, T) - keep on GPU, no .cpu() call needed
             audio_feat = self.audio_vae.encode(audio.to(self.device), self.sample_rate)
-
             audio_feat = audio_feat.view(
                 self.audio_vae.latent_dim,
                 -1,
                 self.patch_size,
             ).permute(1, 2, 0)
-            audio_feat = audio_feat[:-1, ...] # trick: remove the last padding token
             audio_length = audio_feat.size(0)
             text_pad_token = torch.zeros(audio_length, dtype=torch.int32, device=text_token.device)
             text_token = torch.cat([text_token, text_pad_token])
+            # Create audio_pad_feat on GPU (same device as audio_feat)
             audio_pad_feat = torch.zeros(
                 (text_length, self.patch_size, self.audio_vae.latent_dim),
                 dtype=torch.float32,
-                device=text_token.device,
+                device=audio_feat.device,
             )
             audio_feat = torch.cat([audio_pad_feat, audio_feat], dim=0)
-            text_mask = (
-                torch.cat([torch.ones(text_length), torch.zeros(audio_length)]).type(torch.int32).to(text_token.device)
-            )
-            audio_mask = (
-                torch.cat([torch.zeros(text_length), torch.ones(audio_length)]).type(torch.int32).to(text_token.device)
-            )
+            # Create masks directly on model device for consistency
+            text_mask = torch.cat([
+                torch.ones(text_length, dtype=torch.int32, device=self.device),
+                torch.zeros(audio_length, dtype=torch.int32, device=self.device)
+            ])
+            audio_mask = torch.cat([
+                torch.zeros(text_length, dtype=torch.int32, device=self.device),
+                torch.ones(audio_length, dtype=torch.int32, device=self.device)
+            ])
 
         text_token = text_token.unsqueeze(0).to(self.device)
         text_mask = text_mask.unsqueeze(0).to(self.device)
@@ -398,17 +464,17 @@ class VoxCPMModel(nn.Module):
                 audio_feat,
                 audio_mask,
                 min_len=min_len,
-                max_len=int(target_text_length * retry_badcase_ratio_threshold + 10) if retry_badcase else max_len,
+                max_len=min(int(target_text_length * retry_badcase_ratio_threshold + 10), max_len), # avoid too long audio
                 inference_timesteps=inference_timesteps,
                 cfg_value=cfg_value,
                 streaming=streaming,
-                keep_on_device=True,  # Keep on GPU for audio_vae.decode()
             )
             if streaming:
                 patch_len = self.patch_size * self.chunk_size
                 for latent_pred, _ in inference_result:
                     decode_audio = self.audio_vae.decode(latent_pred.to(torch.float32))
-                    decode_audio = decode_audio[..., -patch_len:].squeeze(1).cpu()
+                    # Keep on GPU - caller handles device transfer if needed
+                    decode_audio = decode_audio[..., -patch_len:].squeeze(1)
                     yield decode_audio
                 break
             else:
@@ -424,15 +490,16 @@ class VoxCPMModel(nn.Module):
                     break   
                 
         if not streaming:
-            decode_audio = self.audio_vae.decode(latent_pred.to(torch.float32)).squeeze(1).cpu()  
-            decode_audio = decode_audio[..., 640:-640] # trick: trim the start and end of the audio
+            # Keep on GPU - caller handles device transfer if needed
+            decode_audio = self.audio_vae.decode(latent_pred.to(torch.float32)).squeeze(1)
             yield decode_audio        
     
     @torch.inference_mode()
     def build_prompt_cache(
         self,
         prompt_text: str,
-        prompt_wav_path: str,
+        prompt_wav_path: Optional[str] = None,
+        prompt_tensor: Optional[Dict] = None,
     ):
         """
         Build prompt cache for subsequent fast generation.
@@ -442,39 +509,42 @@ class VoxCPMModel(nn.Module):
             prompt_wav_path: prompt audio path (required)
             
         Returns:
-            prompt_cache: dict with text tokens and audio features
+            prompt_cache: dict with prompt_text (raw text) and audio features.
+                         Text tokenization will be done during generation for consistency.
         """
-        if not prompt_text or not prompt_wav_path:
-            raise ValueError("prompt_text and prompt_wav_path are required")
-        
-        # build text tokens
-        text_token = torch.LongTensor(self.text_tokenizer(prompt_text))
+        if not prompt_text or (not prompt_wav_path and not prompt_tensor):
+            raise ValueError("prompt_text, prompt_wav_path, and prompt_tensor are required")
 
         # load audio
-        audio, sr = torchaudio.load(prompt_wav_path)
+        if prompt_wav_path is not None:
+            audio, sr = load_wav_as_tensor(prompt_wav_path)
+        else:
+            sr = prompt_tensor['sample_rate']
+            audio = prompt_tensor['audio_tensor']
+
         if audio.size(0) > 1:
-            audio = audio.mean(dim=0, keepdim=True)
-            
+            audio = audio.mean(dim=0, keepdim=True)            
         if sr != self.sample_rate:
             audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
 
         patch_len = self.patch_size * self.chunk_size
 
         if audio.size(1) % patch_len != 0:
-            audio = torch.nn.functional.pad(audio, (0, patch_len - audio.size(1) % patch_len))
+            # Left padding: pad at the beginning of the audio to keep valid audio data at the end of the sequence
+            padding_size = patch_len - audio.size(1) % patch_len
+            audio = torch.nn.functional.pad(audio, (padding_size, 0))
 
-        # extract audio features (keep on model device for performance)
+        # extract audio features - keep on GPU for efficient inference
         audio_feat = self.audio_vae.encode(audio.to(self.device), self.sample_rate)
 
         audio_feat = audio_feat.view(
             self.audio_vae.latent_dim,
             -1,
             self.patch_size,
-        ).permute(1, 2, 0) # (D, T, P)
-        audio_feat = audio_feat[:-1, ...] # trick: remove the last padding token
-        # build prompt cache
+        ).permute(1, 2, 0) # (T, P, D) - stays on GPU
+        # build prompt cache - only save raw text and audio features
         prompt_cache = {
-            "text_token": text_token,
+            "prompt_text": prompt_text,
             "audio_feat": audio_feat,
         }
         
@@ -484,7 +554,7 @@ class VoxCPMModel(nn.Module):
     def merge_prompt_cache(
         self,
         original_cache: dict,
-        new_text_token: torch.Tensor,
+        new_text: str,
         new_audio_feat: torch.Tensor,
     ):
         """
@@ -492,42 +562,46 @@ class VoxCPMModel(nn.Module):
         
         Args:
             original_cache: original prompt cache
-            new_text_token: newly generated text tokens
+            new_text: newly generated text 
             new_audio_feat: newly generated audio features
             
         Returns:
-            merged_cache: merged cache
+            merged_cache: merged cache with prompt_text and audio_feat
         """
         if original_cache is None:
             return {
-                "text_token": new_text_token,
+                "prompt_text": new_text,
                 "audio_feat": new_audio_feat,
             }
-        original_text_token = original_cache["text_token"]
+        original_prompt_text = original_cache["prompt_text"]
         original_audio_feat = original_cache["audio_feat"]
-        merged_text_token = torch.cat([original_text_token, new_text_token], dim=0)
+        # Merge text by concatenation
+        merged_prompt_text = original_prompt_text + new_text
         merged_audio_feat = torch.cat([original_audio_feat, new_audio_feat], dim=0)
 
         # build new cache
         merged_cache = {
-            "text_token": merged_text_token,
+            "prompt_text": merged_prompt_text,
             "audio_feat": merged_audio_feat,
         }
         
         return merged_cache
 
+            
     def generate_with_prompt_cache(self, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return next(self._generate_with_prompt_cache(*args, streaming=False, **kwargs))
+
 
     def generate_with_prompt_cache_streaming(
         self, *args, **kwargs
     ) -> Generator[Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]], None, None]:
         return self._generate_with_prompt_cache(*args, streaming=True, **kwargs)
 
+
     @torch.inference_mode()
     def _generate_with_prompt_cache(
         self,
-        target_text: Union[str, List[str]],
+        target_text: str,
         prompt_cache: dict,
         min_len: int = 2,
         max_len: int = 2000,
@@ -537,25 +611,21 @@ class VoxCPMModel(nn.Module):
         retry_badcase_max_times: int = 3,
         retry_badcase_ratio_threshold: float = 6.0,
         streaming: bool = False,
-        auto_chunk: bool = True,
-        chunk_max_tokens: int = 3200,
     ) -> Generator[Tuple[torch.Tensor, torch.Tensor, Union[torch.Tensor, List[torch.Tensor]]], None, None]:
         """
-        Generate audio using pre-built prompt cache with automatic text chunking support.
+        Generate audio using pre-built prompt cache.
         
         Args:
-            target_text: Text to convert to speech (str) or pre-split chunks (List[str])
+            target_text: Text to convert to speech
             prompt_cache: Cache built by build_prompt_cache (can be None)
             min_len: Minimum audio length to avoid very short audio
-            max_len: Maximum audio length per chunk
+            max_len: Maximum audio length
             inference_timesteps: Number of diffusion sampling steps
             cfg_value: Classifier-free guidance value
             retry_badcase: Whether to retry on bad cases
             retry_badcase_max_times: Maximum retry attempts
             retry_badcase_ratio_threshold: Threshold for audio-to-text ratio
             streaming: Whether to return a generator of audio chunks
-            auto_chunk: Whether to automatically split long text (only applies to str input)
-            chunk_max_tokens: Maximum tokens per chunk when auto_chunk=True
             
         Returns:
             Generator of Tuple containing:
@@ -566,110 +636,20 @@ class VoxCPMModel(nn.Module):
         if retry_badcase and streaming:
             warnings.warn("Retry on bad cases is not supported in streaming mode, setting retry_badcase=False.")
             retry_badcase = False
-        
-        # Handle text chunking
-        if isinstance(target_text, list):
-            # Already chunked - process each chunk
-            text_chunks = target_text
-        elif auto_chunk:
-            # Check if text needs chunking using tokenizer
-            temp_tokens = self.text_tokenizer(target_text)
-            if len(temp_tokens) > chunk_max_tokens:
-                # Split the text into chunks using shared utilities
-                from ...shared_text_utils import get_optimal_text_split_points
-                text_chunks = get_optimal_text_split_points(target_text, max_tokens=chunk_max_tokens, model=self)
-            else:
-                text_chunks = [target_text]
-        else:
-            # Single text, no chunking
-            text_chunks = [target_text]
-        
-        # If multiple chunks, process sequentially and merge results
-        if len(text_chunks) > 1:
-            accumulated_audio = []
-            accumulated_text_tokens = []
-            accumulated_audio_features = []
-            current_cache = prompt_cache
-            
-            for chunk_idx, chunk_text in enumerate(text_chunks):
-                # Generate audio for this chunk
-                chunk_generator = self._generate_with_prompt_cache(
-                    target_text=chunk_text,
-                    prompt_cache=current_cache,
-                    min_len=min_len,
-                    max_len=max_len,
-                    inference_timesteps=inference_timesteps,
-                    cfg_value=cfg_value,
-                    retry_badcase=retry_badcase,
-                    retry_badcase_max_times=retry_badcase_max_times,
-                    retry_badcase_ratio_threshold=retry_badcase_ratio_threshold,
-                    streaming=False,  # Process chunks individually, not streaming
-                    auto_chunk=False,  # Prevent recursive chunking
-                    chunk_max_tokens=chunk_max_tokens
-                )
-                
-                chunk_audio, chunk_text_tokens, chunk_audio_feat = next(chunk_generator)
-                
-                # Accumulate results
-                accumulated_audio.append(chunk_audio)
-                accumulated_text_tokens.append(chunk_text_tokens)
-                if isinstance(chunk_audio_feat, list):
-                    accumulated_audio_features.extend(chunk_audio_feat)
-                else:
-                    accumulated_audio_features.append(chunk_audio_feat)
-                
-                # Build new cache for next chunk using merge_prompt_cache
-                if chunk_idx < len(text_chunks) - 1:  # Not the last chunk
-                    if current_cache is None:
-                        # Create initial cache from this chunk's output
-                        chunk_text_token = self.text_tokenizer(chunk_text)
-                        current_cache = {
-                            "text_token": torch.LongTensor(chunk_text_token),
-                            "audio_feat": chunk_audio_feat if not isinstance(chunk_audio_feat, list) else torch.cat(chunk_audio_feat, dim=0)
-                        }
-                    else:
-                        # Merge current cache with this chunk's output
-                        chunk_text_token = self.text_tokenizer(chunk_text)
-                        new_cache = {
-                            "text_token": torch.LongTensor(chunk_text_token),
-                            "audio_feat": chunk_audio_feat if not isinstance(chunk_audio_feat, list) else torch.cat(chunk_audio_feat, dim=0)
-                        }
-                        current_cache = self.merge_prompt_cache(current_cache, new_cache)
-                
-                # Yield intermediate results if streaming
-                if streaming:
-                    yield (
-                        chunk_audio,
-                        chunk_text_tokens, 
-                        accumulated_audio_features.copy()
-                    )
-            
-            # Combine all chunks
-            final_audio = torch.cat(accumulated_audio, dim=-1)  # Concatenate along time dimension
-            final_text_tokens = torch.cat(accumulated_text_tokens, dim=0)
-            final_audio_features = accumulated_audio_features if streaming else torch.cat(accumulated_audio_features, dim=0)
-            
-            # Yield final result
-            yield (final_audio, final_text_tokens, final_audio_features)
-            return
-        
-        # Single chunk processing (original logic)
-        target_text = text_chunks[0]
-        
         # get prompt from cache
         if prompt_cache is None:
-            prompt_text_token = torch.empty(0, dtype=torch.int32)
-            prompt_audio_feat = torch.empty((0, self.patch_size, self.audio_vae.latent_dim), dtype=torch.float32)
+            prompt_audio_feat = torch.empty((0, self.patch_size, self.audio_vae.latent_dim), dtype=torch.float32, device=self.device)
+            text = target_text
         else:
-            prompt_text_token = prompt_cache["text_token"]
             prompt_audio_feat = prompt_cache["audio_feat"]
-        # build target text tokens (ensure same device as prompt tokens)
-        target_text_token = torch.LongTensor(self.text_tokenizer(target_text))
-        if len(prompt_text_token) > 0:
-            target_text_token = target_text_token.to(prompt_text_token.device)
-        else:
-            target_text_token = target_text_token.to(self.device)
-        text_token = torch.cat([prompt_text_token, target_text_token], dim=0)
+            prompt_text = prompt_cache["prompt_text"]
+            text = prompt_text + target_text
+        
+        # Ensure prompt_audio_feat is on the model's device
+        if prompt_audio_feat.device != torch.device(self.device):
+            prompt_audio_feat = prompt_audio_feat.to(self.device)
+        
+        text_token = torch.LongTensor(self.text_tokenizer(text))
         text_token = torch.cat(
             [
                 text_token,
@@ -681,41 +661,27 @@ class VoxCPMModel(nn.Module):
             ],
             dim=-1,
         )
+        
+        target_text_token = torch.LongTensor(self.text_tokenizer(target_text))
 
         audio_length = prompt_audio_feat.size(0)
         text_length = text_token.shape[0]
-        
-        # Create tensors directly on target device to avoid transfers
-        device = self.device
-        dtype = get_dtype(self.config.dtype)
-        
-        text_pad_token = torch.zeros(audio_length, dtype=torch.int32, device=device)
+        text_pad_token = torch.zeros(audio_length, dtype=torch.int32, device=text_token.device)
+        # Create audio_pad_feat on the same device as prompt_audio_feat (GPU)
         audio_pad_feat = torch.zeros(
-            (text_length, self.patch_size, self.audio_vae.latent_dim),
-            dtype=dtype,
-            device=device,
+            (text_token.shape[0], self.patch_size, self.audio_vae.latent_dim),
+            dtype=torch.float32,
+            device=prompt_audio_feat.device,
         )
-        
-        # Move inputs to device once and concatenate (optimize device transfers)
-        text_token = torch.cat([text_token.to(device), text_pad_token])
-        prompt_audio_feat_gpu = prompt_audio_feat.to(device, dtype)  # Single combined transfer
-        audio_feat = torch.cat([audio_pad_feat, prompt_audio_feat_gpu], dim=0)
-        
-        # Create masks directly on device
-        text_mask = torch.cat([
-            torch.ones(text_length, dtype=torch.int32, device=device), 
-            torch.zeros(audio_length, dtype=torch.int32, device=device)
-        ])
-        audio_mask = torch.cat([
-            torch.zeros(text_length, dtype=torch.int32, device=device), 
-            torch.ones(audio_length, dtype=torch.int32, device=device)
-        ])
+        text_token = torch.cat([text_token, text_pad_token])
+        audio_feat = torch.cat([audio_pad_feat, prompt_audio_feat], dim=0)
+        text_mask = torch.cat([torch.ones(text_length), torch.zeros(audio_length)]).type(torch.int32).to(text_token.device)
+        audio_mask = torch.cat([torch.zeros(text_length), torch.ones(audio_length)]).type(torch.int32).to(text_token.device)
 
-        # Add batch dimension (no additional device transfer needed)
-        text_token = text_token.unsqueeze(0)
-        text_mask = text_mask.unsqueeze(0)
-        audio_feat = audio_feat.unsqueeze(0)
-        audio_mask = audio_mask.unsqueeze(0)
+        text_token = text_token.unsqueeze(0).to(self.device)
+        text_mask = text_mask.unsqueeze(0).to(self.device)
+        audio_feat = audio_feat.unsqueeze(0).to(self.device).to(get_dtype(self.config.dtype))
+        audio_mask = audio_mask.unsqueeze(0).to(self.device)
     
         # run inference
         target_text_length = len(self.text_tokenizer(target_text))
@@ -727,17 +693,17 @@ class VoxCPMModel(nn.Module):
                 audio_feat,
                 audio_mask,
                 min_len=min_len,
-                max_len=int(target_text_length * retry_badcase_ratio_threshold + 10) if retry_badcase else max_len,
+                max_len=min(int(target_text_length * retry_badcase_ratio_threshold + 10), max_len), # avoid too long audio
                 inference_timesteps=inference_timesteps,
                 cfg_value=cfg_value,
                 streaming=streaming,
-                keep_on_device=True,  # Keep on GPU for audio_vae.decode()
             )
             if streaming:
                 patch_len = self.patch_size * self.chunk_size
                 for latent_pred, pred_audio_feat in inference_result:
                     decode_audio = self.audio_vae.decode(latent_pred.to(torch.float32))
-                    decode_audio = decode_audio[..., -patch_len:].squeeze(1).cpu()
+                    # Keep on GPU - caller handles device transfer if needed
+                    decode_audio = decode_audio[..., -patch_len:].squeeze(1)
                     yield (
                         decode_audio,
                         target_text_token,
@@ -756,10 +722,8 @@ class VoxCPMModel(nn.Module):
                 else:
                     break
         if not streaming:
+            # Keep on GPU - caller handles device transfer if needed
             decode_audio = self.audio_vae.decode(latent_pred.to(torch.float32)).squeeze(1)
-            decode_audio = decode_audio[..., 640:-640]  # trick: trim the start and end of the audio
-            # Move to CPU only at the very end to avoid unnecessary GPU/CPU transfers
-            #decode_audio = decode_audio.cpu()
 
             yield (
                 decode_audio,
@@ -785,7 +749,7 @@ class VoxCPMModel(nn.Module):
         inference_timesteps: int = 10,
         cfg_value: float = 2.0,
         streaming: bool = False,
-        keep_on_device: bool = False,
+        streaming_prefix_len: int = 3,
     ) -> Generator[Tuple[torch.Tensor, Union[torch.Tensor, List[torch.Tensor]]], None, None]:
         """Core inference method for audio generation.
         
@@ -802,13 +766,11 @@ class VoxCPMModel(nn.Module):
             inference_timesteps: Number of diffusion steps
             cfg_value: Classifier-free guidance value
             streaming: Whether to yield each step latent feature or just the final result
-            keep_on_device: If True, keep results on GPU to avoid unnecessary transfers
             
         Returns:
             Generator of Tuple containing:
                 - Predicted latent feature at the current step if ``streaming=True``, else final latent features
                 - Predicted audio feature sequence so far as a List if ``streaming=True``, else as a concatenated Tensor
-                  (on GPU if keep_on_device=True, else on CPU)
         """
         B, T, P, D = feat.shape
 
@@ -860,7 +822,7 @@ class VoxCPMModel(nn.Module):
                 1, 2
             )  # [b, p, d]
             
-            curr_embed = self.feat_encoder_step(pred_feat.unsqueeze(1))  # b, 1, c
+            curr_embed = self.feat_encoder(pred_feat.unsqueeze(1))  # b, 1, c
             curr_embed = self.enc_to_lm_proj(curr_embed)
             
             pred_feat_seq.append(pred_feat.unsqueeze(1))  # b, 1, p, d
@@ -868,62 +830,160 @@ class VoxCPMModel(nn.Module):
 
             if streaming:
                 # return the last three predicted latent features to provide enough context for smooth decoding
-                pred_feat_chunk = torch.cat(pred_feat_seq[-3:], dim=1)
+                pred_feat_chunk = torch.cat(pred_feat_seq[-streaming_prefix_len:], dim=1)
                 feat_pred = rearrange(pred_feat_chunk, "b t p d -> b d (t p)", b=B, p=self.patch_size)
+                
                 yield feat_pred, pred_feat_seq
             
             stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(dim=-1)[0].cpu().item()
             if i > min_len and stop_flag == 1:
                 break
     
-            # Use consistent device (self.device) to avoid device mismatches
             lm_hidden = self.base_lm.forward_step(
-                curr_embed[:, 0, :], torch.tensor([self.base_lm.kv_cache.step()], device=self.device)
+                curr_embed[:, 0, :], torch.tensor([self.base_lm.kv_cache.step()], device=curr_embed.device)
             ).clone()
            
 
             lm_hidden = self.fsq_layer(lm_hidden)
             residual_hidden = self.residual_lm.forward_step(
-                lm_hidden + curr_embed[:, 0, :], torch.tensor([self.residual_lm.kv_cache.step()], device=self.device)
+                lm_hidden + curr_embed[:, 0, :], torch.tensor([self.residual_lm.kv_cache.step()], device=curr_embed.device)
             ).clone()
                 
         if not streaming:
             pred_feat_seq = torch.cat(pred_feat_seq, dim=1)  # b, t, p, d
-
             feat_pred = rearrange(pred_feat_seq, "b t p d -> b d (t p)", b=B, p=self.patch_size)
-            # Conditionally move to CPU based on keep_on_device flag
-            if keep_on_device:
-                # Keep tensors on GPU for further processing (e.g., in _generate_with_prompt_cache)
-                yield feat_pred, pred_feat_seq.squeeze(0)
-            else:
-                # Move to CPU for final result (traditional behavior)
-                yield feat_pred, pred_feat_seq.squeeze(0).cpu()
+            # Keep pred_feat_seq on GPU - caller handles device transfer if needed
+            yield feat_pred, pred_feat_seq.squeeze(0)
+            
 
     @classmethod
-    def from_local(cls, path: str, optimize: bool = True):
+    def from_local(cls, path: str, optimize: bool = True, training: bool = False, lora_config: LoRAConfig = None):
         config = VoxCPMConfig.model_validate_json(open(os.path.join(path, "config.json")).read())
-
         tokenizer = LlamaTokenizerFast.from_pretrained(path)
-
-        audio_vae = AudioVAE()
+        audio_vae_config = getattr(config, 'audio_vae_config', None)
+        audio_vae = AudioVAE(config=audio_vae_config) if audio_vae_config else AudioVAE()
         vae_state_dict = torch.load(
             os.path.join(path, "audiovae.pth"),
             map_location="cpu",
             weights_only=True,
         )["state_dict"]
-
-        model = cls(config, tokenizer, audio_vae)
-        lm_dtype = get_dtype(model.config.dtype)
-        model = model.to(lm_dtype)
+        model = cls(config, tokenizer, audio_vae, lora_config)
+        if not training:
+            lm_dtype = get_dtype(model.config.dtype)
+            model = model.to(lm_dtype)
+        else: # training mode
+            for name, param in model.named_parameters():
+                if "audio_vae" in name: # freeze VAE weights
+                    param.requires_grad = False
+                    continue
+                if lora_config is not None:
+                    if "lora" not in name: # freeze non-LoRA weights
+                        param.requires_grad = False
         model.audio_vae = model.audio_vae.to(torch.float32)
-
-        model_state_dict = torch.load(
-            os.path.join(path, "pytorch_model.bin"),
-            map_location="cpu",
-            weights_only=True,
-        )["state_dict"]
-
+        
+        # Try to load from safetensors first, fallback to pytorch_model.bin
+        safetensors_path = os.path.join(path, "model.safetensors")
+        pytorch_model_path = os.path.join(path, "pytorch_model.bin")
+        
+        if os.path.exists(safetensors_path) and SAFETENSORS_AVAILABLE:
+            print(f"Loading model from safetensors: {safetensors_path}")
+            model_state_dict = load_file(safetensors_path)
+        elif os.path.exists(pytorch_model_path):
+            print(f"Loading model from pytorch_model.bin: {pytorch_model_path}")
+            checkpoint = torch.load(
+                pytorch_model_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            model_state_dict = checkpoint.get("state_dict", checkpoint)
+        else:
+            raise FileNotFoundError(
+                f"Model file not found. Expected either {safetensors_path} or {pytorch_model_path}"
+            )
+            
         for kw, val in vae_state_dict.items():
             model_state_dict[f"audio_vae.{kw}"] = val
-        model.load_state_dict(model_state_dict, strict=True)
+        
+        # LoRALinear holds weight/bias directly, compatible with nn.Linear state_dict keys.
+        # Using strict=False since pretrained weights don't contain lora_A/lora_B.
+        model.load_state_dict(model_state_dict, strict=False)
+        if training:
+            return model
         return model.to(model.device).eval().optimize(disable=not optimize)
+
+    # ------------------------------------------------------------------ #
+    # LoRA Weight Management
+    # ------------------------------------------------------------------ #
+    def _iter_lora_modules(self):
+        """Iterate over all LoRA modules."""
+        from ..modules.layers.lora import LoRALinear
+        for module in self.modules():
+            if isinstance(module, LoRALinear):
+                yield module
+
+    def load_lora_weights(self, lora_path: str, device: str = None):
+        """
+        Load LoRA weights from file, supports calling after torch.compile.
+        Uses named_parameters() to handle compile's _orig_mod wrapper.
+        Supports both safetensors and pytorch formats.
+        
+        Args:
+            lora_path: Checkpoint path (directory or .safetensors/.ckpt file)
+            device: Target device, defaults to model's current device
+        Returns:
+            tuple: (loaded_keys, skipped_keys)
+        """
+        from pathlib import Path
+        
+        device = device or self.device
+        lora_path = Path(lora_path)
+        
+        # Try safetensors first, then fallback to .ckpt
+        if lora_path.is_dir():
+            safetensors_file = lora_path / "lora_weights.safetensors"
+            ckpt_file = lora_path / "lora_weights.ckpt"
+        else:
+            safetensors_file = lora_path if lora_path.suffix == ".safetensors" else None
+            ckpt_file = lora_path if lora_path.suffix in [".ckpt", ".pth"] else None
+        
+        # Load from safetensors if available
+        if safetensors_file and safetensors_file.exists() and SAFETENSORS_AVAILABLE:
+            state_dict = load_file(str(safetensors_file), device=device)
+        elif ckpt_file and ckpt_file.exists():
+            ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
+            state_dict = ckpt.get("state_dict", ckpt)
+        else:
+            raise FileNotFoundError(
+                f"LoRA checkpoint not found. Expected either {safetensors_file} or {ckpt_file}"
+            )
+        
+        # Build param mapping (handle torch.compile's _orig_mod prefix)
+        model_params = dict(self.named_parameters())
+        key_mapping = {k.replace("._orig_mod.", "."): k for k in model_params if "._orig_mod." in k}
+        
+        loaded_keys, skipped_keys = [], []
+        for key, value in state_dict.items():
+            target_key = key if key in model_params else key_mapping.get(key)
+            if target_key:
+                model_params[target_key].data.copy_(value.to(device))
+                loaded_keys.append(key)
+            else:
+                skipped_keys.append(key)
+        
+        return loaded_keys, skipped_keys
+
+    def set_lora_enabled(self, enabled: bool):
+        """Enable/disable all LoRA layers."""
+        for module in self._iter_lora_modules():
+            module.set_enabled(enabled)
+
+    def reset_lora_weights(self):
+        """Reset all LoRA weights (A: kaiming, B: zeros), effectively unloading LoRA."""
+        for module in self._iter_lora_modules():
+            module.reset_lora_parameters()
+
+    def get_lora_state_dict(self) -> dict:
+        """Get all LoRA parameters (lora_A/lora_B)."""
+        return {name: param.data.clone() 
+                for name, param in self.named_parameters() 
+                if "lora_" in name}

@@ -32,7 +32,7 @@ def remove_bracket(text):
 
 
 # spell Arabic numerals
-def spell_out_number(text: str, inflect_parser):
+def spell_out_number(text: str, inflect_parser: inflect.engine):
     new_text = []
     st = None
     for i, c in enumerate(text):
@@ -181,17 +181,5 @@ class TextNormalizer:
         else:
             text = self.en_tn_model.normalize(text)
             text = spell_out_number(text, self.inflect_parser)
-        
         if split is False:
             return text
-        else:
-            # Split text into manageable chunks using the built-in splitting logic
-            return split_paragraph(
-                text=text,
-                tokenize=self.tokenizer if self.tokenizer else (lambda x: x.split()),
-                lang=lang,
-                token_max_n=80 if lang == "zh" else 120,  # Adjust for English vs Chinese
-                token_min_n=60 if lang == "zh" else 80,
-                merge_len=20 if lang == "zh" else 30,
-                comma_split=False
-            )

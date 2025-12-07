@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Shared Application Utilities Module for SkyrimNet TTS Applications
 Contains common application initialization, setup, and configuration functions

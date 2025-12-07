@@ -1,40 +1,53 @@
 --extra-index-url=https://download.pytorch.org/whl/cu129
-torch<2.9
+torch<2.9.1
 torchaudio
 
 #TRITON*************************************
 #https://github.com/woct0rdho/triton-windows/releases/download/empty/triton-3.3.0-py3-none-any.whl ; sys_platform == 'win32' #egg:3.3.0
-triton-windows<3.5; sys_platform == 'win32' # tw
+triton-windows; sys_platform == 'win32' # tw
+triton; sys_platform != 'win32' # linux and mac
+
+transformers
 
 psutil
 loguru
 pydantic
+
+# web stuff
+python-multipart
+fastapi
 uvicorn
-transformers
-gradio
+
+
 huggingface_hub
 hf_xet
 faster-whisper
-soundfile
+
 setuptools<81
-#cupy-cuda12x  #??
-numpy #
-#modelscope #
-
-#
 einops #
-#inflect #
-
-#wetext #
-
-#addict
-#datasets>=3,<4
-#simplejson
-#sortedcontainers
-#
-#funasr #?
-#spaces #?
 tqdm #
-#librosa #
+inflect #
+wetext #
+addict
+simplejson
+argbind
+safetensors
 
-#noisereduce # testing this
+
+#gradio
+
+# only for training
+#datasets<4
+#modelscope #??
+#soundfile
+#librosa
+#sortedcontainers
+#numpy #
+#modelscope #
+# soundfile
+#cupy-cuda12x  #??
+
+
+# pydub gets installed
+# torch has a bug on Windows
+# patch_torch_dll.ps1 patches the torch dlls on Windows

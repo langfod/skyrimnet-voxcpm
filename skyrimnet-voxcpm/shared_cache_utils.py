@@ -3,17 +3,21 @@ import threading
 import psutil
 import torch
 from datetime import datetime
-import torchaudio
 import os
-import warnings
 import json
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any, List
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Any, List
 from loguru import logger
 
 
+if TYPE_CHECKING:
+    try:
+        from .voxcpm.core import VoxCPM
+    except ImportError:
+        from voxcpm.core import VoxCPM
+
 class PromptCacheManager:
-    """In-memory cache manager for VoxCPM prompt caches (adapted from XTTS LatentCacheManager)."""
+    """In-memory cache manager for VoxCPM prompt caches."""
 
     def __init__(self):
         self._cache: Dict[str, Dict[str, Any]] = {}
@@ -69,22 +73,14 @@ def get_latent_dir(language: str = "en") -> Path:
 
 @functools.cache
 def get_speakers_dir(language: str = "en") -> Path:
-    """Get or create the speakers directory"""
-    # Use parent directory to find speakers folder (handles both root and subdir execution)
-    current_dir = Path(__file__).parent
-    # If we're in skyrimnet-xtts/, go up one level; otherwise use current
-    if current_dir.name == "skyrimnet-xtts":
-        speakers_base = current_dir.parent / "speakers"
-    else:
-        speakers_base = current_dir / "speakers"
-    
-    speakers_dir = speakers_base / language
+    """Get or create the speakers directory"""        
+    speakers_dir = Path("speakers").joinpath(language)
     speakers_dir.mkdir(parents=True, exist_ok=True)
     return speakers_dir
 
 @functools.cache
-def get_cache_key(audio_path, uuid: int | None = None) -> Optional[str]:
-    """Generate a cache key based on audio file, UUID"""
+def get_cache_key(audio_path) -> Optional[str]:
+    """Generate a cache key based on audio file"""
     if audio_path is None:
         return None
 
@@ -103,7 +99,7 @@ def _load_transcription_metadata(metadata_filename: Path) -> Optional[Dict]:
     return None
 
 
-def _get_model_device(model):
+def _get_model_device(model: "VoxCPM") -> torch.device:
     """Safely get the device from a model, handling different model types."""
     try:
         # Try direct device access first (VoxCPM wrapper)
@@ -184,34 +180,29 @@ def resolve_speaker_audio_path(speaker_audio: str, language: str = "en") -> Opti
     return speaker_audio
 
 
-def get_cached_prompt_cache(model, language: str, speaker_audio: str, speaker_audio_uuid: int = None):
+def get_cached_prompt_cache(model: "VoxCPM" = None, language: str= "en", speaker_audio: str=None) -> Optional[Dict[str, Any]]:
     """
-    Get or build VoxCPM prompt cache for a speaker (adapted from XTTS get_latent_from_audio).
+    Get or build VoxCPM prompt cache for a speaker.
     
     Args:
         model: VoxCPM model instance
         language: Language code
         speaker_audio: Path to speaker audio file or speaker name
-        speaker_audio_uuid: Optional UUID for caching
         
     Returns:
         Prompt cache dict that can be used with VoxCPM generation
     """
-    if speaker_audio is None:
+    if speaker_audio is None or model is None:
         return None
     
-    # Resolve speaker audio path (handles both full paths and speaker names)
-    resolved_audio_path = resolve_speaker_audio_path(speaker_audio, language)
-    if resolved_audio_path is None:
-        logger.error(f"Could not resolve speaker audio: {speaker_audio}")
-        return None
+
     
-    cache_file_key = get_cache_key(resolved_audio_path, speaker_audio_uuid)
+    cache_file_key = get_cache_key(speaker_audio)
     
     # Check in-memory cache first
     cached = cache_manager.get(language, cache_file_key)
     if cached:
-        logger.info(f"Using cached prompt cache for {Path(resolved_audio_path).stem}")
+        logger.info(f"Using cached prompt cache for {Path(speaker_audio).stem}")
         return cached
 
     # Check disk cache
@@ -253,7 +244,7 @@ def get_cached_prompt_cache(model, language: str, speaker_audio: str, speaker_au
                 transcription_preview = metadata.get('transcription', 'N/A')[:50]
                 logger.debug(f"Loaded prompt cache with transcription: '{transcription_preview}...'")
             
-            logger.debug(f"Loaded prompt cache from disk for {Path(resolved_audio_path).stem}")
+            logger.debug(f"Loaded prompt cache from disk for {Path(speaker_audio).stem}")
             return prompt_cache
             
         except Exception as e:
@@ -261,7 +252,13 @@ def get_cached_prompt_cache(model, language: str, speaker_audio: str, speaker_au
             # Continue to rebuild cache below
 
     # Build prompt cache using VoxCPM
-    logger.info(f"Building prompt cache for: {resolved_audio_path}")
+    logger.info(f"Building prompt cache for: {speaker_audio}")
+    
+    # Resolve speaker audio path (handles both full paths and speaker names)
+    resolved_audio_path = resolve_speaker_audio_path(speaker_audio, language)
+    if resolved_audio_path is None:
+        logger.error(f"Could not resolve speaker audio: {speaker_audio}")
+        return None
     try:
         # First transcribe the audio
         try:
@@ -274,8 +271,18 @@ def get_cached_prompt_cache(model, language: str, speaker_audio: str, speaker_au
             language=language,
             use_cache=True
         )
-        
-        # Build VoxCPM prompt cache (call low-level method to avoid circular dependency)
+
+        #audio, sr = load_wav_as_tensor(resolved_audio_path)
+        #audio_tensor = model.denoiser.enhance_tensor(audio)
+        #prompt_tensor = {
+        #    'audio_tensor': audio_tensor,
+        #    'sample_rate': sr
+        #}
+        ## Build VoxCPM prompt cache (call low-level method to avoid circular dependency)
+        #prompt_cache = model.tts_model.build_prompt_cache(
+        #    prompt_text=transcription,
+        #    prompt_tensor=prompt_tensor
+        #)
         prompt_cache = model.tts_model.build_prompt_cache(
             prompt_text=transcription,
             prompt_wav_path=resolved_audio_path
@@ -313,10 +320,12 @@ def get_cached_prompt_cache(model, language: str, speaker_audio: str, speaker_au
         
     except Exception as e:
         logger.error(f"Failed to build prompt cache for {resolved_audio_path}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
-def get_reference_audio_and_text(model, language: str, speaker_audio: str, speaker_audio_uuid: int = None) -> Tuple[str, str]:
+def get_reference_audio_and_text(model, language: str, speaker_audio: str) -> Tuple[str, str]:
     """
     Legacy function for compatibility. Get reference audio path and its transcription.
     
@@ -327,7 +336,6 @@ def get_reference_audio_and_text(model, language: str, speaker_audio: str, speak
         model: VoxCPM model (for compatibility)
         language: Language code
         speaker_audio: Path to speaker audio file or speaker name
-        speaker_audio_uuid: Optional UUID for caching
         
     Returns:
         Tuple[str, str]: (audio_path, transcription_text)
@@ -364,7 +372,6 @@ def get_reference_audio_and_text(model, language: str, speaker_audio: str, speak
 def init_prompt_cache(model, supported_languages: List[str] = ["en"]) -> None:
     """
     Initialize VoxCPM prompt cache from disk for all supported languages.
-    Adapted from XTTS init_latent_cache but for VoxCPM prompt caches.
     """
     cached_prompts = {}
     for lang in supported_languages:
@@ -402,34 +409,31 @@ def init_prompt_cache(model, supported_languages: List[str] = ["en"]) -> None:
             except Exception as e:
                 logger.error(f"Failed to load cache file {filename}: {e}")
         
-        speaker_dir = get_speakers_dir(language=lang)
+        speaker_dir = get_speakers_dir(language=lang)  
+        print(f"Loading speakers from: {speaker_dir}")      
+        # Get all speaker files and organize by base name
+        speaker_files = {}
+        for file_path in speaker_dir.iterdir():
+            print(f"Found speaker file: {file_path}")
+            if file_path.is_file() and file_path.suffix in ['.wav']:
+                base_name = file_path.stem
+                if base_name not in speaker_files:
+                    speaker_files[base_name] = {}
+                speaker_files[base_name][file_path.suffix] = file_path
         
-        # Get all speaker audio files
-        speaker_files = []
-        for ext in ['.wav', '.mp3', '.flac', '.ogg']:
-            speaker_files.extend(speaker_dir.glob(f"*{ext}"))
-        
-        #logger.info(f"Found {len(speaker_files)} speaker files for language '{lang}'")
-        
-        # Process each speaker audio file
-        for speaker_file in speaker_files:
-            base_name = speaker_file.stem
-            
-            if base_name in cached_prompts.get(lang, []):
-                continue  # Already cached
-            
+        # Process each speaker, preferring .wav over .json
+        for base_name, files in speaker_files.items():
             try:
-                logger.info(f"Processing audio file: {speaker_file}")
-                prompt_cache = get_cached_prompt_cache(model, lang, str(speaker_file))
-                
-                if prompt_cache is not None:
-                    logger.debug(f"Successfully cached prompt for {base_name}")
-                else:
-                    logger.warning(f"Failed to cache prompt for {base_name}")
-                    
+                if '.wav' in files:
+                    # .wav files - compute latents from audio
+                    speaker_wav_path = files['.wav']
+                    logger.info(f"Processing .wav file: {speaker_wav_path}")
+                    get_cached_prompt_cache(model=model, speaker_audio=str(speaker_wav_path), language=lang)                                   
             except Exception as e:
-                logger.error(f"Failed to process speaker {base_name}: {e}")
-
+                import traceback
+                traceback.print_exc()
+                logger.error(f"Failed to load latents for speaker {base_name}: {e}") 
+    
     stats = cache_manager.get_stats()
     logger.info(
         f"Initialized prompt cache with {stats['total_entries']} entries across languages: {stats['languages_list']}")
@@ -445,11 +449,6 @@ def get_prompt_cache_stats() -> Dict[str, int]:
     return cache_manager.get_stats()
 
 
-# Note: No separate initialization wrapper needed - 
-# init_prompt_cache() is called automatically by initialize_model_with_cache()
-# just like the original XTTS system calls init_latent_cache()
-
-
 @functools.cache
 def get_wavout_dir():
     formatted_start_time = get_process_creation_time().strftime("%Y%m%d_%H%M%S")
@@ -458,19 +457,4 @@ def get_wavout_dir():
     return wavout_dir
 
 
-def save_torchaudio_wav(wav_tensor, sr, audio_path, uuid: int = None) -> Path:
-    """Save a tensor as a WAV file using torchaudio"""
 
-    if wav_tensor.device.type != 'cpu':
-        #logger.debug(f"Converting tensor from {wav_tensor.device} to CPU for audio saving")
-        wav_tensor = wav_tensor.cpu()
-
-    formatted_now_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    filename = f"{formatted_now_time}_{get_cache_key(audio_path, uuid)}"
-    path = Path(get_wavout_dir(), f"{filename}.wav")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        torchaudio.save(path, wav_tensor, sr, encoding="PCM_S")
-    del wav_tensor
-    return path #.resolve()

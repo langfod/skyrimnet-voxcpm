@@ -7,6 +7,8 @@ Contains common environment setup, constants, and configuration settings
 import os
 import sys
 
+import torch
+
 
 # =============================================================================
 # ENVIRONMENT SETUP
@@ -28,9 +30,12 @@ def setup_environment():
         os.environ["TORCH_COMPILE_CPP_FORCE_X64"] = "1"
         os.environ["DISTUTILS_USE_SDK"] = "1" 
         os.environ["MSSdk"] = "1"
+    # Enable TF32 for better performance on Ampere+ GPUs
+    torch.backends.fp32_precision = "tf32"
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    torch.set_float32_matmul_precision("high")
+    
 
-    # TTS Library configuration (legacy compatibility)
-    os.environ["COQUI_TOS_AGREED"] = "1"
 
     import warnings
     warnings.filterwarnings("ignore", module='Setuptools.*', append=True)
@@ -68,10 +73,10 @@ DEFAULT_CACHE_CONFIG = {
 
 # Default TTS inference parameters for VoxCPM
 DEFAULT_TTS_PARAMS = {
-    "CFG_VALUE": 2.0,
+    "CFG_VALUE": 1.6,
     "INFERENCE_TIMESTEPS": 10,
-    "NORMALIZE": True,
-    "DENOISE": True,
+    "NORMALIZE": False,
+    "DENOISE": False,
     "MAX_LENGTH": 4096
 }
 
