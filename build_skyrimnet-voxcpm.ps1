@@ -71,6 +71,8 @@ if ($test) {
     Copy-Item -Path "assets" -Destination "dist\SkyrimNet-VoxCPM\" -Force -Recurse
     Copy-Item -Path "examples\Start.bat" -Destination "dist\SkyrimNet-VoxCPM\" -Force -Recurse
     Copy-Item -Path "examples\Start_VoxCPM.ps1" -Destination "dist\SkyrimNet-VoxCPM\" -Force -Recurse
+    Copy-Item -Path "skyrimnet_config.txt" -Destination "dist\SkyrimNet-VoxCPM\" -Force
+
 
 
     Set-Location -Path ./dist/SkyrimNet-VoxCPM
@@ -98,6 +100,7 @@ if ($test) {
     Copy-Item -Path "examples\Start_VoxCPM.ps1" -Destination "archive/$PACKAGE_NAME\" -Force
     Copy-Item -Path "dist\skyrimnet-voxcpm\skyrimnet-voxcpm.exe" -Destination "archive/$PACKAGE_NAME\" -Force
     Copy-Item -Path "dist\skyrimnet-voxcpm\_internal" -Destination "archive/$PACKAGE_NAME\" -Force -Recurse
+    Copy-Item -Path "skyrimnet_config.txt" -Destination "archive/$PACKAGE_NAME\" -Force
 
 
     if (-not $noarchive) {
